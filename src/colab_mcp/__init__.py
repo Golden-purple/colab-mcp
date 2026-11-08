@@ -16,13 +16,20 @@ import argparse
 import asyncio
 import datetime
 import logging
+from pathlib import Path
 import tempfile
 import sys
 
 from fastmcp import FastMCP
 from fastmcp.utilities import logging as fastmcp_logger
 
-from colab_mcp.session import ColabSessionProxy
+from colab_mcp.connection_state import DEFAULT_STATE_FILE
+from colab_mcp.session import (
+    EXISTING_TAB_WAIT,
+    UI_CONNECTION_TIMEOUT,
+    ColabSessionProxy,
+    ConnectionOptions,
+)
 
 
 mcp = FastMCP(name="ColabMCP")
@@ -60,6 +67,36 @@ def parse_args(v):
         action="store_true",
         default=True,
     )
+    parser.add_argument(
+        "--authuser",
+        help="Google account used when a new Colab notebook is opened: account index "
+        "(0, 1, ...) or email address. Defaults to the browser's default account.",
+        default=None,
+    )
+    parser.add_argument(
+        "--connect-timeout",
+        help="total seconds one connection attempt may take before giving up (default: %(default)s)",
+        type=float,
+        default=UI_CONNECTION_TIMEOUT,
+    )
+    parser.add_argument(
+        "--existing-tab-wait",
+        help="seconds to wait for an already-open Colab tab to (re)connect before opening "
+        "a new notebook; 0 opens a new notebook immediately (default: %(default)s)",
+        type=float,
+        default=EXISTING_TAB_WAIT,
+    )
+    parser.add_argument(
+        "--no-persist",
+        help="use a fresh random token/port every run (open tabs can't reconnect by reloading)",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--state-file",
+        help="where the reusable token/port are stored (default: %(default)s)",
+        type=Path,
+        default=DEFAULT_STATE_FILE,
+    )
     return parser.parse_args(v)
 
 
@@ -69,7 +106,15 @@ async def main_async():
 
     if args.enable_proxy:
         logging.info("enabling session proxy tools")
-        session_mcp = ColabSessionProxy()
+        session_mcp = ColabSessionProxy(
+            ConnectionOptions(
+                connect_timeout=args.connect_timeout,
+                existing_tab_wait=args.existing_tab_wait,
+                authuser=args.authuser,
+                persist_connection=not args.no_persist,
+                state_file=args.state_file,
+            )
+        )
         await session_mcp.start_proxy_server()
         mcp.mount(session_mcp.proxy_server)
         for middleware in session_mcp.middleware:

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import anyio
 import asyncio
 from colab_mcp.websocket_server import ColabWebSocketServer
 from mcp.types import JSONRPCRequest, JSONRPCResponse, JSONRPCMessage
@@ -21,7 +22,9 @@ import websockets
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("origin_domain", ["https://colab.google.com", "https://colab.research.google.com"])
+@pytest.mark.parametrize(
+    "origin_domain", ["https://colab.google.com", "https://colab.research.google.com"]
+)
 async def test_successful_connection(origin_domain):
     async with ColabWebSocketServer() as server:
         client = await websockets.connect(
@@ -54,37 +57,89 @@ async def test_unauthorized_origin_rejected():
         assert not server.connection_live.is_set()
 
 
+async def _connect(server):
+    return await websockets.connect(
+        f"ws://localhost:{server.port}",
+        origin="https://colab.google.com",
+        subprotocols=["mcp"],
+        additional_headers={"Authorization": f"Bearer {server.token}"},
+    )
+
+
 @pytest.mark.asyncio
-async def test_second_connection_rejected():
+async def test_newer_connection_replaces_older():
     async with ColabWebSocketServer() as server:
-        client1 = await websockets.connect(
-            f"ws://localhost:{server.port}",
-            origin="https://colab.google.com",
-            subprotocols=["mcp"],
-            additional_headers={"Authorization": f"Bearer {server.token}"},
-        )
+        client1 = await _connect(server)
         assert server.connection_live.is_set()
+        assert server.connection_generation == 1
 
-        client2 = await websockets.connect(
-            f"ws://localhost:{server.port}",
-            origin="https://colab.google.com",
-            subprotocols=["mcp"],
-            additional_headers={"Authorization": f"Bearer {server.token}"},
-        )
+        client2 = await _connect(server)
 
+        # the stale/older tab is kicked out...
         with pytest.raises(
             websockets.exceptions.ConnectionClosed,
-            match="Server is busy",
-            check=lambda e: e.rcvd.code == 1013,
+            match="Replaced by a newer Colab connection",
         ):
-            # assert we cannot ping via the second client
-            await client2.ping()
+            await asyncio.wait_for(client1.recv(), timeout=2)
 
-        # assert we can ping via the original client
-        pong = await client1.ping()
-        pong_latency = await pong
-        assert pong_latency > 0
-        await client1.close()
+        # ...and the newer one is served
+        for _ in range(20):
+            if server.connection_generation == 2:
+                break
+            await asyncio.sleep(0.05)
+        assert server.connection_generation == 2
+        assert server.connection_live.is_set()
+        pong = await client2.ping()
+        assert await pong > 0
+        await client2.close()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_ends_read_stream():
+    """In-flight MCP requests must fail fast (not hang) when the tab goes away."""
+    async with ColabWebSocketServer() as server:
+        client = await _connect(server)
+        read_stream = server.read_stream
+        closed = server.connection_closed
+        await client.close()
+        await asyncio.wait_for(closed.wait(), timeout=2)
+        with pytest.raises(anyio.EndOfStream):
+            await asyncio.wait_for(read_stream.receive(), timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_reconnect_gets_fresh_streams():
+    async with ColabWebSocketServer() as server:
+        client = await _connect(server)
+        first_stream = server.read_stream
+        await client.close()
+        await asyncio.wait_for(server.connection_closed.wait(), timeout=2)
+
+        client = await _connect(server)
+        assert server.connection_live.is_set()
+        assert server.read_stream is not first_stream
+        await client.send(
+            JSONRPCResponse(jsonrpc="2.0", id="x", result={}).model_dump_json()
+        )
+        msg = await asyncio.wait_for(server.read_stream.receive(), timeout=1)
+        assert msg.message.root.id == "x"
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_preferred_port_and_token_reused():
+    async with ColabWebSocketServer() as first:
+        port = first.port
+    async with ColabWebSocketServer(port=port, token="saved-token") as server:
+        assert server.port == port
+        assert server.token == "saved-token"
+
+
+@pytest.mark.asyncio
+async def test_preferred_port_busy_falls_back():
+    async with ColabWebSocketServer() as first:
+        async with ColabWebSocketServer(port=first.port) as second:
+            assert second.port not in (0, first.port)
 
 
 @pytest.mark.asyncio
